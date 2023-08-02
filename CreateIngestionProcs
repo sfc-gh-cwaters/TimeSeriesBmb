@@ -1,0 +1,178 @@
+CREATE OR REPLACE PROCEDURE BOMBARDIER.TS_LOAD.LOAD_FLIGHT_FILE("V_FNAME" VARCHAR(16777216))
+RETURNS VARCHAR(16777216)
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS 'declare
+    fid INTEGER;
+    msg VARCHAR;
+    start_date DATE;
+begin
+    begin transaction;
+    select file_seq.nextval into :fid;
+    insert into file_header(file_id, file_name, file_type, serial, tail, record_start_date, min_ts)
+    (
+        with t as (select * from (select * from raw1 where fname = :v_fname and seq in (1, 2, 3, 4, 9))
+        pivot(max(l) for seq in (1, 2, 3, 4, 9)) 
+        as p(file_name, file_type, aircraft_serial, aircraft_tail, recording_start_date, first_ts)
+        )
+        select
+            :fid,
+            file_name,
+            split_part(file_type, '','', 2) file_type,
+            split_part(aircraft_serial, '','', 2) aircraft_serial_number,
+            split_part(aircraft_tail, '','', 2) aircraft_tail_number,
+            to_date(split_part(recording_start_date, '','', 2),''YYYY-MM-DD'') recording_start_date,
+            timestamp_ntz_from_parts(to_date(split_part(recording_start_date, '','', 2),''YYYY-MM-DD''), to_timestamp(split_part(first_ts, '','', 1), ''HH24:MI:SS.FF9'')) min_ts
+        from
+            t
+    ); 
+    msg := ''file_id:''||:fid||'' >> files count: ''||sqlrowcount;
+    insert into file_var (
+        with t as (
+            select * from (select * from raw1 where fname = :v_fname and seq between 5 and 8)
+            pivot(max(l) for seq in (5, 6, 7, 8)) 
+            as p(file_name, variable_list, validity_list, units_list, variable_size)
+            ),
+        var as (
+            select
+                file_name,
+                index, 
+                trim(value,''"'') var
+            from
+                t,
+                lateral split_to_table (t.variable_list, '','')
+            ),
+        unit as (
+            select
+                file_name,
+                index, 
+                trim(value,''"'') var
+            from
+                t,
+                lateral split_to_table (t.units_list, '','')
+            ),
+        vu as (
+            select
+                v.file_name,
+                v.index,
+                v.var variable,
+                u.var unit
+            from
+                var v left join unit u on v.file_name = u.file_name and v.index = u.index),
+        valid as (
+            select
+                file_name,
+                index, 
+                trim(value,''"'') var
+            from
+                t,
+                lateral split_to_table (t.validity_list, '','')
+            ),
+        vsize as (
+            select
+                file_name,
+                index, 
+                trim(value,''"'') var
+            from
+                t,
+                lateral split_to_table (t.variable_size, '','')
+            )
+        select
+            :fid file_id, 
+            vu.index var_id,
+            vu.variable,
+            vu.unit,
+            vld.var var_valid,
+            vs.var var_size
+        from
+            vu, valid vld, vsize vs
+        where
+            vu.file_name = vld.file_name
+            and vu.file_name = vs.file_name
+            and vu.index = vld.index
+            and vu.index = vs.index
+            and vu.index > 1    
+    );
+    msg := msg || '' >> variables count:''||sqlrowcount;
+    insert into file_var_val(
+        with sd as
+            (select record_start_date from file_header where file_id = :fid),
+        r as (
+            select 
+                r.seq,
+                s.index var_id,
+                s.value
+            from
+                raw1 r,
+                lateral split_to_table (r.l, '','') s
+                where 
+                    fname = :v_fname
+                    and r.seq > 8)
+        ,mn as 
+            (select to_timestamp(value, ''HH24:MI:SS.FF9'') min_ts from r where seq = 9 and var_id = 1)            
+        ,t as (
+            select 
+                seq, 
+                var_id, 
+                mn.min_ts,
+                to_timestamp_ntz(value, ''HH24:MI:SS.FF9'') ts_part, 
+                -- assuming flight log cannot be longer than 24 hours
+                case when ts_part < mn.min_ts then timestamp_ntz_from_parts(dateadd(day, 1, sd.record_start_date), ts_part)
+                    else timestamp_ntz_from_parts(sd.record_start_date, ts_part) end ts,
+                to_date(ts) ds,
+                hour(ts) * 3600 + minute(ts) * 60 + second(ts) second_index,
+                TIMEDIFF( millisecond , DATE_TRUNC(''SECOND'', ts) , ts) ms_index
+            from 
+                r,
+                mn,
+                sd
+            where
+                var_id = 1)  
+        select
+            :fid file_id,
+            t.ts,
+            t.ds,
+            r.var_id,
+            try_to_number(r.value, 38, 18) value_number,
+            r.value value_text,
+            t.second_index,
+            t.ms_index
+        from
+            r,
+            t
+        where
+            r.seq = t.seq
+            and r.var_id > 1
+            and r.value is not null 
+            and length(r.value) > 0
+    );
+    msg := msg || '' >> values count:''||SQLROWCOUNT;    
+    commit;
+    return msg;
+exception
+    when other then
+        rollback;
+        raise;
+end';
+
+
+CREATE OR REPLACE PROCEDURE BOMBARDIER.TS_LOAD.LOAD_FLIGHT_DIRECTORY("V_DIRECTORY" VARCHAR(16777216))
+RETURNS VARCHAR(16777216)
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS 'declare
+    i integer := 0;
+    msg varchar := '''';
+    f varchar;
+begin
+    LET res resultset := (select relative_path from directory(@bmb_load) where regexp_substr(relative_path,''^(.+)\\/([^\\/]+)$'', 1, 1, ''e'', 1)||''/'' = :v_directory);
+    LET cF cursor for res;
+    
+    FOR row_variable IN cF DO
+        f := row_variable.relative_path;
+        --msg := msg || f || chr(10);
+        call load_flight_file(:f);
+        i := i + 1;    
+    END FOR;
+    return ''total files loaded = ''||to_varchar(i);
+end';
