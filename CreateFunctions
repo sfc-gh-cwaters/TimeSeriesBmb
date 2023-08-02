@@ -1,0 +1,154 @@
+
+
+CREATE OR REPLACE FUNCTION val_lin_interpolate(V_STARTTIME TIMESTAMP_NTZ(9), V_ENDTIME TIMESTAMP_NTZ(9), V_FILEID NUMBER(10,0), V_VARLIST VARCHAR(16777216), V_SAMPLERATE VARCHAR(10))
+RETURNS TABLE (TS TIMESTAMP_NTZ(9), VAR_ID NUMBER(10,0), VAL NUMBER(38, 18), FILE_ID NUMBER(10,0))
+LANGUAGE SQL
+AS $$
+    with varlist as 
+    (select to_number(trim(value)) var_id from table(split_to_table(v_VARLIST,',')))
+    ,mn as (
+    select nvl(min(ts), v_StartTime) ts from (
+        select var_id, max(ts) ts from file_var_val  -- gets the earliest tag times for each tag
+        where file_id = v_fileid
+        and var_id in (select var_id from varlist)  
+        and ds between dateadd(day, -30, v_StartTime) and v_StartTime
+        and ts <= v_StartTime
+        group by var_id)
+    )
+    ,mx as ( 
+        select nvl(max(ts), v_EndTime) ts from (
+        select var_id, min(ts) ts from file_var_val -- gets the latest tag times for each tag
+        where file_id = v_fileid
+        and var_id in (select var_id from varlist)   
+        and ds between dateadd(day, -1, v_EndTime) and dateadd(day, 30, v_EndTime)
+        and ts >= v_EndTime
+        group by var_id))
+    ,vals as (
+    select file_id, var_id, ts, ds, avg(val) val from (
+        select 
+            tv.file_id,
+            tv.var_id,
+            --date_trunc(second, tv.ts) ts,  
+            tv.ts,
+            tv.ds,
+            tv.val_number val
+        from 
+            file_var_val tv
+        where  
+            file_id = v_fileid
+            and var_id in (select var_id from varlist)
+            and tv.ds between dateadd(day, -30, v_StartTime) and dateadd(day, 30, v_EndTime) 
+            -- will have issues of course if there is no prior value within 30 days of requested data
+            and tv.ts between (select ts from mn) and (select ts from mx))
+    group by file_id, var_id, ds, ts)      
+    ,var_times as(
+    select
+      v.var_id,
+      d.day_index,
+      d.date_value,
+      s.second_index,
+      timestampadd(millisecond, nvl(ms.ms_index, 0), timestampadd(second, s.second_index, d.date_value)) ts,
+      1 include
+    from
+        base_day d,
+        base_second s,
+        -- base millisecond table returns one row in the case where the sample rate is > 1s
+        -- but returns 1000 rows for sample rate < 1s
+        (select * from base_millisecond where include = decode(left(v_SampleRate, 1), 'M', 1, 0)) ms,
+        varlist v
+    where
+        d.date_value between date_trunc(day, v_StartTime) and date_trunc(day, dateadd(day, 1, v_EndTime))
+        and timestampadd('second', s.second_index, d.date_value) between v_StartTime and v_EndTime
+        and decode(v_SampleRate, 'S1', s.s1m, 'S2', s.s2m, 'S4', s.s4m, 'S5', s.s5m, 'S10', s.s10m, 'S15', s.s15m, 'S20', s.s20m, 'S30', s.s30m, 
+                   'M1', s.m1m, 'M2', s.m2m, 'M5', s.m5m, 'M10', s.m10m, 'M15', s.m15m, 'M20', s.m20m, 'M30', s.m30m, 
+                   'H1', s.h1m, 'H2', s.h2m, 'H3', s.h3m, 'H4', s.h4m, 'H6', s.h6m, 'H12', s.h12m, 'D1', s.d1m, 
+                   'MS1', 0, 'MS2', ms.ms2m, 'MS4', ms.ms4m, 'MS5', ms.ms5m, 'MS10', ms.ms10m, 'MS15', ms.ms15m, 'MS20', ms.ms20m, 'MS30', ms.ms30m, 'MS50', ms.ms50m,
+                   'MS100', ms.ms100m, 'MS200', ms.ms200m, 'MS250', ms.ms250m, 'MS300', ms.ms300m, 'MS400', ms.ms400m, 'MS500', ms.ms500m, 1) = 0
+     )
+    ,var_times_vals as (
+        select
+          r.file_id,
+          nvl(i.ts, r.ts) ts,
+          nvl(i.var_id, r.var_id) var_id,
+          r.ts rawts,
+          r.val rawval,
+          last_value(r.val ignore nulls) over (partition by nvl(i.var_id, r.var_id) order by nvl(i.ts, r.ts) rows between unbounded preceding and current row) as last_val,
+          first_value(r.val ignore nulls) over (partition by nvl(i.var_id, r.var_id) order by nvl(i.ts, r.ts) rows between current row and unbounded following) as next_val,
+          last_value(r.ts ignore nulls) over (partition by nvl(i.var_id, r.var_id) order by nvl(i.ts, r.ts) rows between unbounded preceding and current row) as last_val_ts,    
+          first_value(r.ts ignore nulls) over (partition by nvl(i.var_id, r.var_id) order by nvl(i.ts, r.ts) rows between current row and unbounded following) as next_val_ts,              
+          i.include
+        from
+          vals r full outer join var_times i on i.var_id = r.var_id and i.date_value = r.ds and i.ts = r.ts)
+     ,interp as (
+        select
+            file_id,
+            ts,
+            var_id,
+            rawval,
+            last_val,
+            next_val,
+            last_val_ts,
+            next_val_ts,
+            include,
+            timestampdiff(millisecond, last_val_ts, next_val_ts) tdif_base,
+            timestampdiff(millisecond, last_val_ts, ts) tdif,
+            nvl2(last_val_ts, nvl(rawval, decode(next_val - last_val, 0, last_val, last_val + (next_val - last_val) / tdif_base * tdif)), null) ival
+       from
+        var_times_vals
+       where include = 1
+         )
+    select 
+        ts tstamp,
+        var_id,
+        ival,
+        file_id
+    from interp 
+    order by file_id, var_id, ts    
+$$;
+
+CREATE OR REPLACE FUNCTION val_avg(V_STARTTIME TIMESTAMP_NTZ(9), V_ENDTIME TIMESTAMP_NTZ(9), V_FILEID NUMBER(10,0), V_VARLIST VARCHAR(16777216), V_SAMPLERATE VARCHAR(10))
+RETURNS TABLE (TS TIMESTAMP_NTZ(9), VAR_ID NUMBER(10,0), VAL NUMBER(38, 18), FILE_ID NUMBER(10,0))
+LANGUAGE SQL
+AS $$   
+   select 
+        timestampadd('second', 
+        decode(v_SampleRate, 'S1', 0, 'S2', 1, 'S4', 2, 'S5', 2, 'S10', 5, 'S15', 7, 'S20', 10, 'S30', 15, 
+                   'M1', 30, 'M2', 60, 'M5', 150, 'M10', 300, 'M15', 450, 'M20', 600, 'M30', 900, 
+                   'H1', 1800, 'H2', 3600, 'H3', 5400, 'H4', 7200, 'H6', 10800, 'H12', 21600, 43200)
+                   , min(ts)) ts, 
+        tv.var_id,
+        avg(val_number) val_number,
+        tv.file_id
+    from ts_load.file_var_val tv, ts_load.base_second s
+    where file_id = v_fileid
+    and tv.ts between v_starttime and v_endtime
+    and tv.second_index = s.second_index
+    and var_id in (select to_number(trim(value)) from table(split_to_table(v_VARLIST,',')))
+    group by 
+        tv.file_id,
+        tv.var_id,
+        tv.ds,
+        case v_SampleRate 
+        when 'S1' then s.SECOND_INDEX
+        when 'S2' then s.S2
+        when 'S4' then s.S4
+        when 'S5' then s.S5
+        when 'S10' then s.S10
+        when 'S15' then s.S15
+        when 'S20' then s.S20
+        when 'S30' then s.S30
+        when 'M1' then s.M1
+        when 'M2' then s.M2
+        when 'M5' then s.M5
+        when 'M10' then s.M10
+        when 'M15' then s.M15
+        when 'M20' then s.M20
+        when 'M30' then s.M30
+        when 'H1' then s.H1
+        when 'H2' then s.H2
+        when 'H3' then s.H3
+        when 'H4' then s.H4
+        when 'H6' then s.H6
+        when 'H12' then s.H12 end
+$$
+;
